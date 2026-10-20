@@ -310,9 +310,9 @@ with st.sidebar:
     # API anahtarı sunucu tarafında (st.secrets) tutulur; kullanıcı görmez ve girmez.
     try:
         SERVER_KEY = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
-        SERVER_MODEL = str(st.secrets.get("GEMINI_MODEL", "gemini-2.5-flash")).strip()
+        SERVER_MODEL = str(st.secrets.get("GEMINI_MODEL", "gemini-3.8-flash")).strip()
     except Exception:
-        SERVER_KEY, SERVER_MODEL = "", "gemini-2.5-flash"
+        SERVER_KEY, SERVER_MODEL = "", "gemini-3.8-flash"
 
     if SERVER_KEY:
         api_key, model_name = SERVER_KEY, SERVER_MODEL
@@ -322,7 +322,7 @@ with st.sidebar:
         st.subheader("🤖 Gemini (İsteğe Bağlı)")
         api_key = st.text_input("Google Gemini API Key", type="password",
                                 help="Boş bırakılırsa yerel yedek (mock) tavsiye metni üretilir.")
-        model_name = st.text_input("Model adı", value="gemini-2.5-flash")
+        model_name = st.text_input("Model adı", value="gemini-3.8-flash")
         if not GENAI_OK:
             st.caption("google-generativeai kurulu değil; yerel yedek mod kullanılacak.")
 
