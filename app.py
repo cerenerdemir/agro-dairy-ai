@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# Agro-Dairy AI | Çiftçi Dostu Sürüm
+# Agro-Dairy AI | Çiftçi + Kooperatif Modlu Sürüm
 # Kurulum:
-#   pip install streamlit pandas google-generativeai
+#   pip install streamlit plotly pandas google-generativeai
 # Çalıştırma:
 #   streamlit run app.py
 
@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -442,149 +443,369 @@ with st.sidebar:
 MAX_AI_CALLS = 5
 
 # ----------------------------------------------------------------------------
-# SAYFA BAŞI
+# ORTAK YARDIMCILAR: KÖY SEÇİMİ, GİRİŞLER, PARAMETRELER, GEMINI
+# ----------------------------------------------------------------------------
+st.markdown(
+    """<style>
+.big.power {border-left-color: #f9a825;}
+.big.power .num {color: #8a6100;}
+.big.co2 {border-left-color: #6d4c41;}
+.big.co2 .num {color: #5d4037;}
+.report {background: #fffdf5; border: 2px solid #e4dcc0; border-radius: 16px; padding: 18px 20px;
+         font-size: 1.15rem; line-height: 1.65; color: #2b2b2b;}
+</style>""",
+    unsafe_allow_html=True,
+)
+
+VILLAGE_DEPTHS = {
+    "Kocapınar (Ortalama 160 m)": 160,
+    "Burdur Merkez / Çendik (Ortalama 150 m)": 150,
+    "Kozluca (Ortalama 180 m)": 180,
+    "Büğdüz (Ortalama 170 m)": 170,
+    "Karakent / Yeşilova Çevresi (Ortalama 140 m)": 140,
+    "Diğer / Havza Geneli (Ortalama 180 m)": 180,
+}
+POOL_M3 = 2500.0       # olimpik havuz ≈ 2.500 m³
+CO2_KG_PER_KWH = 0.44  # kg CO2e / kWh
+NIGHT_HOURS = {22, 23, 0, 1, 2, 3, 4, 5}
+
+
+def farm_inputs(prefix, coop):
+    """Çiftlik girdileri. coop=True ise tipik çiftlik için nötr dille sorar."""
+    ad = "Ali Dayı"
+    if not coop:
+        ad = st.text_input("Sana nasıl hitap edelim?", value="Ali Dayı", key=f"{prefix}_ad")
+    c1, c2 = st.columns(2)
+    with c1:
+        cows = st.number_input("Sağmal İnek Sayın Kaç?" if not coop else "Tipik çiftlikte sağmal inek sayısı",
+                               min_value=5, max_value=200, value=30, step=1, key=f"{prefix}_cows")
+    with c2:
+        area = st.number_input("Kaba Yem / Mısır Ektiğin Tarla Kaç Dönüm?" if not coop
+                               else "Tipik çiftlikte kaba yem alanı (dönüm)",
+                               min_value=1, max_value=2000, value=20, step=1, key=f"{prefix}_area")
+    milk = st.number_input("Bir inek günde ortalama kaç litre süt veriyor?" if not coop
+                           else "İnek başı günlük süt verimi (litre)",
+                           min_value=10.0, max_value=45.0, value=24.0, step=1.0, key=f"{prefix}_milk")
+    village = st.selectbox("Bulunduğunuz Köy / Bölge", options=list(VILLAGE_DEPTHS.keys()),
+                           index=len(VILLAGE_DEPTHS) - 1, key=f"{prefix}_village")
+    depth = VILLAGE_DEPTHS[village]
+    manual = st.checkbox("Kuyu derinliğimi tam biliyorum (Manuel gir)", key=f"{prefix}_manual")
+    if manual:
+        depth = st.number_input("Kuyunun Boru / Pompa Derinliği Kaç Metre?", min_value=50, max_value=250,
+                                value=int(depth), step=5, key=f"{prefix}_depth")
+        st.caption("✍️ Kendi girdiğiniz kuyu derinliği hesapta kullanılıyor.")
+    else:
+        st.caption(f"💡 Seçilen bölgeye göre tahmini kuyu derinliği otomatik ayarlandı ({depth} m).")
+    timing = None
+    if not coop:
+        timing = st.radio("Sulama Zamanı", ["☀️ Gündüz Suluyorum", "🌙 Gece Suluyorum (İndirimli)"],
+                          horizontal=True, key=f"{prefix}_timing")
+    return {"ad": ad, "cows": cows, "area": area, "milk": milk, "depth": depth, "village": village,
+            "night": bool(timing and timing.startswith("🌙"))}
+
+
+def make_params(fi, night):
+    return {
+        "cows": int(fi["cows"]), "milk": float(fi["milk"]), "area": int(fi["area"]), "depth": int(fi["depth"]),
+        "night": night, "price": float(price), "night_disc": float(night_disc), "eff": float(eff),
+        "water_red": float(water_red), "season_months": int(season_months), "bw": float(bw),
+        "conc_price": float(conc_price), "rounds": int(rounds),
+    }
+
+
+def gemini_text(system_role, prompt):
+    """Genel amaçlı Gemini çağrısı (ana model, olmazsa yedek model)."""
+    genai.configure(api_key=api_key)
+    try:
+        fallback = str(st.secrets.get("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")).strip()
+    except Exception:
+        fallback = "gemini-3.5-flash-lite"
+    candidates = [model_name] + ([fallback] if fallback and fallback != model_name else [])
+    last_err = None
+    for name in candidates:
+        try:
+            model = genai.GenerativeModel(name, system_instruction=system_role)
+            return (model.generate_content(prompt).text or "").strip(), name
+        except Exception as exc:
+            last_err = exc
+    raise last_err
+
+
+def can_use_ai():
+    return bool(api_key) and GENAI_OK
+
+
+# ----------------------------------------------------------------------------
+# 👨‍🌾 ÇİFTÇİ GÖRÜNÜMÜ
+# ----------------------------------------------------------------------------
+def farmer_view():
+    weather_slot = st.container()
+    st.markdown('<div class="sec-title">📝 Çiftliğini Anlat</div>', unsafe_allow_html=True)
+    fi = farm_inputs("f", coop=False)
+    ad = fi["ad"]
+    params = make_params(fi, fi["night"])
+    res = run_engine(params)
+    weather = get_weather()
+    warnings = build_warnings(weather, res["round_cost"])
+    wlines = [w["text"] for w in warnings]
+
+    with weather_slot:
+        st.markdown(weather_html(weather, warnings, params, res), unsafe_allow_html=True)
+
+    st.markdown('<div class="sec-title">📊 Senin İçin Hesapladık</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="big"><div class="lbl">💰 Fatura Tasarrufun</div>'
+        f'<div class="num">{fmt(res["elec_saving"])} TL</div>'
+        f'<div class="sub">Cebinde Kalacak (sezonluk, kuyu elektriği %{fmt(res["elec_pct"])} azalıyor). '
+        f'Ek yem gideri düşülürse net: {fmt(res["net_benefit"])} TL</div></div>',
+        unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="big water"><div class="lbl">💧 Kurtarılan Yeraltı Suyu</div>'
+        f'<div class="num">{fmt(res["water_saved"])} Ton Su</div>'
+        f'<div class="sub">Yaklaşık {fmt(res["water_saved"] / TANKER_TON)} traktör tankeri su yerinde kalıyor</div></div>',
+        unsafe_allow_html=True)
+    if res["milk_change"] == 0:
+        st.markdown(
+            f'<div class="big milk"><div class="lbl">🥛 Süt Verimi</div><div class="num">%0 Kayıp</div>'
+            f'<div class="sub">{fmt(params["milk"])} L/inek/gün korunuyor (toplam {fmt(res["milk_day"])} L/gün)</div></div>',
+            unsafe_allow_html=True)
+    else:
+        st.markdown(
+            f'<div class="big milk"><div class="lbl">🥛 Süt Verimi</div>'
+            f'<div class="num">%{fmt(abs(res["milk_change"]), 1)} düşebilir</div>'
+            f'<div class="sub">Kooperatif mühendisiyle yem planını gözden geçirin</div></div>',
+            unsafe_allow_html=True)
+    st.caption("Rakamlar örnek Burdur verileriyle hesaplanmış tahmindir. Ekim ve sulama kararı her zaman sizdedir.")
+
+    sig = hashlib.md5((repr(sorted(params.items())) + ad + model_name + str(bool(api_key)) + "|".join(wlines)).encode()).hexdigest()
+    mock_msg, mock_note = mock_advice(params, res, ad, warnings)
+    st.session_state.setdefault("advice", None)
+
+    st.markdown('<div class="sec-title">💬 Sana Özel WhatsApp Mesajı</div>', unsafe_allow_html=True)
+    if st.button("✨ Mesajı Yapay Zekâ ile Yaz", type="primary", key="f_ai"):
+        calls = st.session_state.get("ai_calls", 0)
+        if can_use_ai() and calls >= MAX_AI_CALLS:
+            st.info("Bu oturumdaki yapay zekâ hakkı doldu. Hazır şablon mesaj gösteriliyor.")
+            st.session_state["advice"] = (sig, mock_msg, mock_note, "Hazır şablon")
+        elif can_use_ai():
+            st.session_state["ai_calls"] = calls + 1
+            try:
+                with st.spinner("Ziraat mühendisi mesajı yazıyor..."):
+                    g_msg, g_note = gemini_advice(api_key, model_name, params, res, ad, wlines)
+                st.session_state["advice"] = (sig, g_msg, g_note, f"Gemini ({model_name})")
+            except Exception as exc:
+                st.warning(f"Yapay zekâya şu an ulaşılamadı, hazır şablon kullanılıyor. Ayrıntı: {exc}")
+                st.session_state["advice"] = (sig, mock_msg, mock_note, "Hazır şablon")
+        else:
+            st.info("Yapay zekâ anahtarı olmadığı için hazır şablon mesaj gösteriliyor.")
+            st.session_state["advice"] = (sig, mock_msg, mock_note, "Hazır şablon")
+
+    adv = st.session_state["advice"]
+    if adv and adv[0] == sig:
+        _, msg_text, tech_note, source = adv
+    else:
+        msg_text, tech_note, source = mock_msg, mock_note, "Hazır şablon"
+
+    now_t = datetime.datetime.now().strftime("%H:%M")
+    st.markdown(
+        f'<div class="phone"><div class="hdr">💬 Burdur Sulama Kooperatifi</div>'
+        f'<div class="bubble">{html.escape(msg_text)}<span class="time">{now_t} ✓✓</span></div></div>',
+        unsafe_allow_html=True)
+    st.write("")
+    b1, b2 = st.columns(2)
+    with b1:
+        copy_button(msg_text)
+    with b2:
+        st.link_button("🟢 WhatsApp ile Paylaş", "https://wa.me/?text=" + urllib.parse.quote(msg_text),
+                       use_container_width=True)
+
+    st.write("")
+    report = build_report(params, res, ad, msg_text, tech_note, source, warnings)
+    st.download_button("📄 Raporu İndir (.txt)", data=report.encode("utf-8"),
+                       file_name="agro_dairy_karar_raporu.txt", mime="text/plain", key="f_dl")
+    st.caption("Bölgesel etkiyi görmek için sayfanın en üstünden Kooperatif / Birlik Paneli'ni seçin.")
+
+
+# ----------------------------------------------------------------------------
+# 🏢 KOOPERATİF / BİRLİK PANELİ (BÖLGESEL ETKİ)
+# ----------------------------------------------------------------------------
+def hourly_profile(e_round, n_farms, night_share):
+    out = []
+    for h in range(24):
+        if h in NIGHT_HOURS:
+            out.append(e_round * n_farms * night_share / 8.0)
+        else:
+            out.append(e_round * n_farms * (1 - night_share) / 16.0)
+    return out
+
+
+def coop_mock_report(fi, res, n, share, t):
+    return (
+        f"Burdur Havzası'nda sistemi kullanan {fmt(n)} çiftlik için yapılan değerlendirmede, silajlık mısır payının %40 "
+        f"azaltılıp sorgum-sudan otu ve fiğe kaydırılması halinde sezonluk yeraltı suyu çekiminin yaklaşık "
+        f"{fmt(t['water'])} m³ ({fmt(t['pools'], 1)} olimpik havuz eşdeğeri) azalacağı öngörülmektedir. Pompa elektriği "
+        f"{fmt(t['kwh'])} kWh düşmekte, çiftliklerin %{fmt(share * 100)}'inin gece (22:00-06:00) sulamasına geçmesiyle birlikte "
+        f"toplam elektrik gideri {fmt(t['tl'])} TL azalmaktadır. Bu, yaklaşık {fmt(t['co2'], 1)} tCO2e salım azalımına karşılık gelir. "
+        f"Rasyon dengesi sayesinde inek başı süt veriminde kayıp öngörülmemekte, ek konsantre yem maliyeti toplam "
+        f"{fmt(t['feed'])} TL olarak hesaplanmıştır. Gündüz pik pompa yükü {fmt(t['peak_cur'])} kW'tan {fmt(t['peak_opt'])} kW'a "
+        f"inmektedir. Sonuçlar sentetik veriler ve varsayımlara dayanmaktadır; pilot uygulamada fatura ve sayaç verisiyle "
+        f"doğrulanması ve nihai ekim kararının üreticiye bırakılması önerilir."
+    )
+
+
+def coop_view():
+    st.markdown('<div class="sec-title">📝 Tipik Çiftlik ve Bölge Bilgisi</div>', unsafe_allow_html=True)
+    fi = farm_inputs("c", coop=True)
+    n = int(st.number_input("Bu Köyde / Havzada Sistemi Kullanan Çiftlik Sayısı", min_value=1, max_value=5000,
+                            value=50, step=1, key="c_n"))
+    share = st.slider("Gece (22:00-06:00) sulamasına geçen çiftlik oranı (%)", 0, 100, 70, key="c_share") / 100.0
+
+    params = make_params(fi, False)
+    res = run_engine(params)
+
+    # çiftlik başı karma tarifeyle maliyet, sonra çiftlik sayısıyla çarpım
+    cost_b_farm = res["e_b"] * price * (1 - night_disc / 100.0 * share)
+    saving_farm = res["cost_a"] - cost_b_farm
+    e_round_a, e_round_b = res["e_a"] / max(1, rounds), res["e_b"] / max(1, rounds)
+    cur = hourly_profile(e_round_a, n, 0.10)
+    opt = hourly_profile(e_round_b, n, share)
+    day_idx = [h for h in range(24) if h not in NIGHT_HOURS]
+    peak_cur, peak_opt = max(cur[h] for h in day_idx), max(opt[h] for h in day_idx)
+    kwh_tot = res["kwh_saved"] * n
+    t = {
+        "water": res["water_saved"] * n, "kwh": kwh_tot, "tl": saving_farm * n,
+        "co2": kwh_tot * CO2_KG_PER_KWH / 1000.0, "feed": res["extra_feed_cost"] * n,
+        "pools": res["water_saved"] * n / POOL_M3, "peak_cur": peak_cur, "peak_opt": peak_opt,
+    }
+
+    st.markdown(f'<div class="sec-title">🌍 {fmt(n)} Çiftliğin Toplam Bölgesel Etkisi (sezonluk)</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="big water"><div class="lbl">💧 Toplam Korunan Akifer Suyu</div>'
+        f'<div class="num">{fmt(t["water"])} m³</div>'
+        f'<div class="sub">≈ {fmt(t["pools"], 1)} olimpik havuz ≈ {fmt(t["water"] / TANKER_TON)} traktör tankeri</div></div>',
+        unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="big power"><div class="lbl">⚡ Şebekeden Silinen Toplam Elektrik Faturası</div>'
+        f'<div class="num">{fmt(t["tl"])} TL</div>'
+        f'<div class="sub">{fmt(t["kwh"])} kWh daha az elektrik (net: ek yem düşülünce {fmt(t["tl"] - t["feed"])} TL)</div></div>',
+        unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="big co2"><div class="lbl">🌱 Tahmini Karbon Azalımı</div>'
+        f'<div class="num">{fmt(t["co2"], 1)} tCO2e</div>'
+        f'<div class="sub">Kurtarılan elektrik × {CO2_KG_PER_KWH} kg CO2e/kWh / 1000</div></div>',
+        unsafe_allow_html=True)
+    st.caption(f"Süt verimi: tipik çiftlikte {fmt(params['milk'])} L/inek/gün korunuyor "
+               f"(toplam {fmt(res['milk_day'] * n)} L/gün, %0 kayıp). Rakamlar sentetik veri ve varsayımlarla hesaplanmıştır.")
+
+    st.markdown('<div class="sec-title">📈 Grafikler</div>', unsafe_allow_html=True)
+    labels = ["Mevcut Durum", "Agro-Dairy AI"]
+    fig_w = go.Figure(go.Bar(x=labels, y=[res["water_a"] * n, res["water_b"] * n],
+                             marker_color=["#b45309", "#2e7d32"],
+                             text=[f"{fmt(res['water_a'] * n)} m³", f"{fmt(res['water_b'] * n)} m³"],
+                             textposition="outside"))
+    fig_w.update_layout(title="Sezonluk Toplam Su Tüketimi (m³)", yaxis_title="m³", height=420,
+                        margin=dict(t=60, b=20), showlegend=False, font=dict(size=16),
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig_w, use_container_width=True)
+
+    hours = [f"{h:02d}:00" for h in range(24)]
+    fig_h = go.Figure()
+    fig_h.add_trace(go.Bar(x=hours, y=cur, name="Mevcut Durum", marker_color="#b45309"))
+    fig_h.add_trace(go.Bar(x=hours, y=opt, name="Agro-Dairy AI (gece kaydırmalı)", marker_color="#2e7d32"))
+    fig_h.update_layout(title="Sulama Gününde Saatlik Pompa Yükü (kW) - Trafo Yükü", barmode="group",
+                        yaxis_title="kW (ortalama)", height=460, margin=dict(t=60, b=20),
+                        legend=dict(orientation="h", y=-0.2), font=dict(size=15),
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig_h, use_container_width=True)
+    red = (1 - peak_opt / peak_cur) * 100 if peak_cur else 0.0
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Gündüz pik yük (şimdi)", f"{fmt(peak_cur)} kW")
+    m2.metric("Gündüz pik yük (öneri)", f"{fmt(peak_opt)} kW")
+    m3.metric("Gündüz yükü azalışı", f"%{fmt(red)}")
+    st.caption("Saatlik yük modeli: sulama gününde tüm çiftliklerin bir sulama turunu aynı gün yaptığı varsayılır; "
+               "mevcut durumda çiftliklerin %10'u, öneride seçtiğiniz oranı gece sular. Sentetik bir senaryodur.")
+
+    st.markdown('<div class="sec-title">🏛️ Kooperatif Teknik Karar Özeti</div>', unsafe_allow_html=True)
+    sig = hashlib.md5((repr(sorted(params.items())) + str(n) + str(share) + model_name + str(bool(api_key))).encode()).hexdigest()
+    mock_text = coop_mock_report(fi, res, n, share, t)
+    st.session_state.setdefault("coop_advice", None)
+    if st.button("✨ Resmi Raporu Yapay Zekâ ile Yaz", type="primary", key="c_ai"):
+        calls = st.session_state.get("ai_calls", 0)
+        if can_use_ai() and calls >= MAX_AI_CALLS:
+            st.info("Bu oturumdaki yapay zekâ hakkı doldu. Kural tabanlı rapor gösteriliyor.")
+            st.session_state["coop_advice"] = (sig, mock_text, "Kural tabanlı şablon")
+        elif can_use_ai():
+            st.session_state["ai_calls"] = calls + 1
+            prompt = (
+                "Aşağıdaki hesaplanmış bölgesel sonuçlara göre kooperatif yönetim kurulu için TEK PARAGRAFLIK resmi bir "
+                "'Teknik Karar Özeti' yaz. Rakamları aynen kullan, uydurma. Varsayımları ve doğrulama ihtiyacını belirt. "
+                "Nihai ekim kararının üreticide kaldığını vurgula.\n"
+                f"- Sistemi kullanan çiftlik sayısı: {fmt(n)}; tipik çiftlik: {params['cows']} inek, {params['area']} dönüm, "
+                f"{params['depth']} m derinlik\n"
+                f"- Sezonluk korunan su: {fmt(t['water'])} m³ ({fmt(t['pools'], 1)} olimpik havuz)\n"
+                f"- Azalan elektrik: {fmt(t['kwh'])} kWh; fatura azalışı: {fmt(t['tl'])} TL; ek yem maliyeti: {fmt(t['feed'])} TL\n"
+                f"- Karbon azalımı: {fmt(t['co2'], 1)} tCO2e (0,44 kg CO2e/kWh)\n"
+                f"- Gece sulamasına geçen çiftlik oranı: %{fmt(share * 100)}; gündüz pik yük {fmt(peak_cur)} kW -> {fmt(peak_opt)} kW\n"
+                "- Süt verimi kaybı: %0 (rasyon dengesi modeli)")
+            try:
+                with st.spinner("Rapor hazırlanıyor..."):
+                    text, used = gemini_text(
+                        "Sen Burdur Damızlık Sığır Yetiştiricileri Birliği ve Sulama Kooperatifi uzmanısın. "
+                        "Resmi, net, sayısal ve dürüst bir kurum diliyle yazarsın.", prompt)
+                st.session_state["coop_advice"] = (sig, text, f"Gemini ({used})")
+            except Exception as exc:
+                st.warning(f"Yapay zekâya şu an ulaşılamadı, kural tabanlı rapor kullanılıyor. Ayrıntı: {exc}")
+                st.session_state["coop_advice"] = (sig, mock_text, "Kural tabanlı şablon")
+        else:
+            st.info("Yapay zekâ anahtarı olmadığı için kural tabanlı rapor gösteriliyor.")
+            st.session_state["coop_advice"] = (sig, mock_text, "Kural tabanlı şablon")
+
+    cadv = st.session_state["coop_advice"]
+    if cadv and cadv[0] == sig:
+        _, report_text, rsource = cadv
+    else:
+        report_text, rsource = mock_text, "Kural tabanlı şablon"
+    st.markdown(f'<div class="report">{html.escape(report_text)}</div>', unsafe_allow_html=True)
+    st.caption(f"Metin kaynağı: {rsource}")
+
+    now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+    full = (f"AGRO-DAIRY AI | KOOPERATİF BÖLGESEL ETKİ RAPORU\nTarih: {now} | Kaynak: {rsource}\n{'=' * 60}\n\n"
+            f"Çiftlik sayısı: {fmt(n)} | Gece sulama oranı: %{fmt(share * 100)}\n"
+            f"Tipik çiftlik: {params['cows']} inek, {params['area']} dönüm, {params['depth']} m, {fmt(params['milk'])} L/inek/gün\n\n"
+            f"Korunan su: {fmt(t['water'])} m³ ({fmt(t['pools'], 1)} havuz, {fmt(t['water'] / TANKER_TON)} tanker)\n"
+            f"Azalan elektrik: {fmt(t['kwh'])} kWh | Fatura azalışı: {fmt(t['tl'])} TL | Ek yem: {fmt(t['feed'])} TL\n"
+            f"Karbon azalımı: {fmt(t['co2'], 1)} tCO2e\n"
+            f"Gündüz pik yük: {fmt(peak_cur)} kW -> {fmt(peak_opt)} kW\n\n"
+            f"TEKNİK KARAR ÖZETİ\n{report_text}\n\n"
+            "Not: Sonuçlar sentetik veri ve varsayımlarla üretilmiş karar destek çıktısıdır.\n")
+    st.write("")
+    st.download_button("📄 Kooperatif Raporunu İndir (.txt)", data=full.encode("utf-8"),
+                       file_name="agro_dairy_kooperatif_raporu.txt", mime="text/plain", key="c_dl")
+
+    with st.expander("🔧 Tipik çiftlik hesap ayrıntıları"):
+        st.dataframe(pd.DataFrame({
+            "Gösterge": ["Su (m³/sezon)", "Pompa elektriği (kWh/sezon)", "Elektrik faturası (TL/sezon)"],
+            "Mevcut Durum": [fmt(res["water_a"]), fmt(res["e_a"]), fmt(res["cost_a"])],
+            "Agro-Dairy AI": [fmt(res["water_b"]), fmt(res["e_b"]), fmt(cost_b_farm)],
+        }), use_container_width=True, hide_index=True)
+        st.caption("Pompa enerjisi: E (kWh) = (Su m³ × Derinlik m × 9,81) / (3600 × Pompa verimi). "
+                   "Katsayılar ve fiyatlar sentetik varsayımdır, saha verisiyle doğrulanmalıdır.")
+
+
+# ----------------------------------------------------------------------------
+# SAYFA BAŞI VE MOD SEÇİMİ
 # ----------------------------------------------------------------------------
 st.markdown(
     '<div class="hero"><div class="h1">🌾 Agro-Dairy AI</div>'
-    '<div class="h2">Burdur çiftçisi için su, elektrik ve süt hesabı. Sütünüz aynı kalsın, faturanız ve suyunuz azalsın.</div></div>',
+    '<div class="h2">Burdur Havzası su, elektrik ve süt hesabı. Sütünüz aynı kalsın, faturanız ve suyunuz azalsın.</div></div>',
     unsafe_allow_html=True,
 )
-weather_slot = st.container()  # hava kartı, hesaplar bitince doldurulacak
+MODE_FARMER = "👨‍🌾 Çiftçi Görünümü (Sade Mobil)"
+MODE_COOP = "🏢 Kooperatif / Birlik Paneli (Bölgesel Etki)"
+mode = st.radio("Kullanıcı Modu", [MODE_FARMER, MODE_COOP], horizontal=True, key="mode")
 
-# ----------------------------------------------------------------------------
-# GİRİŞLER (ÇİFTÇİ DİLİ)
-# ----------------------------------------------------------------------------
-st.markdown('<div class="sec-title">📝 Çiftliğini Anlat</div>', unsafe_allow_html=True)
-ad = st.text_input("Sana nasıl hitap edelim?", value="Ali Dayı")
-c1, c2 = st.columns(2)
-with c1:
-    cows = st.number_input("Sağmal İnek Sayın Kaç?", min_value=5, max_value=200, value=30, step=1)
-with c2:
-    area = st.number_input("Kaba Yem / Mısır Ektiğin Tarla Kaç Dönüm?", min_value=1, max_value=2000, value=20, step=1)
-milk = st.number_input("Bir inek günde ortalama kaç litre süt veriyor?", min_value=10.0, max_value=45.0,
-                       value=24.0, step=1.0)
-depth = st.select_slider(
-    "Kuyunun Boru / Pompa Derinliği Kaç Metre?",
-    options=[50, 100, 150, 180, 220], value=180,
-    format_func=lambda v: f"{v} m" + ("  (Kocapınar / Burdur ortalaması)" if v == 180 else ""),
-)
-st.caption("Bilmiyorsan 180 m seç. Burdur bölgesi ortalamasıdır.")
-timing = st.radio("Sulama Zamanı", ["☀️ Gündüz Suluyorum", "🌙 Gece Suluyorum (İndirimli)"], horizontal=True)
-
-params = {
-    "cows": int(cows), "milk": float(milk), "area": int(area), "depth": int(depth),
-    "night": timing.startswith("🌙"), "price": float(price), "night_disc": float(night_disc),
-    "eff": float(eff), "water_red": float(water_red), "season_months": int(season_months),
-    "bw": float(bw), "conc_price": float(conc_price), "rounds": int(rounds),
-}
-res = run_engine(params)
-weather = get_weather()
-warnings = build_warnings(weather, res["round_cost"])
-wlines = [w["text"] for w in warnings]
-
-with weather_slot:
-    st.markdown(weather_html(weather, warnings, params, res), unsafe_allow_html=True)
-
-# ----------------------------------------------------------------------------
-# SONUÇ: 3 DEV KART
-# ----------------------------------------------------------------------------
-st.markdown('<div class="sec-title">📊 Senin İçin Hesapladık</div>', unsafe_allow_html=True)
-st.markdown(
-    f'<div class="big"><div class="lbl">💰 Faturandan Sezonluk Kazancın</div>'
-    f'<div class="num">{fmt(res["elec_saving"])} TL</div>'
-    f'<div class="sub">Cebinde Kalacak (kuyu elektriği %{fmt(res["elec_pct"])} azalıyor)</div></div>',
-    unsafe_allow_html=True)
-st.markdown(
-    f'<div class="big water"><div class="lbl">💧 Kuyudan Kurtardığın Su</div>'
-    f'<div class="num">{fmt(res["water_saved"])} Ton</div>'
-    f'<div class="sub">Yaklaşık {fmt(res["water_saved"] / TANKER_TON)} traktör tankeri su yerinde kalıyor</div></div>',
-    unsafe_allow_html=True)
-if res["milk_change"] == 0:
-    milk_html = (f'<div class="big milk"><div class="lbl">🥛 İneklerinin Süt Verimi</div>'
-                 f'<div class="num">Kayıp Yok!</div>'
-                 f'<div class="sub">Günlük süt aynen devam ediyor: {fmt(res["milk_day"])} litre/gün</div></div>')
+if mode == MODE_FARMER:
+    farmer_view()
 else:
-    milk_html = (f'<div class="big milk"><div class="lbl">🥛 İneklerinin Süt Verimi</div>'
-                 f'<div class="num">%{fmt(abs(res["milk_change"]), 1)} düşebilir</div>'
-                 f'<div class="sub">Kooperatif mühendisiyle yem planını gözden geçirin</div></div>')
-st.markdown(milk_html, unsafe_allow_html=True)
-st.caption("Rakamlar örnek Burdur verileriyle hesaplanmış tahmindir. Ekim ve sulama kararı her zaman sizdedir.")
-
-# ----------------------------------------------------------------------------
-# MESAJ ÜRETİMİ
-# ----------------------------------------------------------------------------
-sig = hashlib.md5((repr(sorted(params.items())) + ad + model_name + str(bool(api_key)) + "|".join(wlines)).encode()).hexdigest()
-mock_msg, mock_note = mock_advice(params, res, ad, warnings)
-st.session_state.setdefault("advice", None)
-
-st.markdown('<div class="sec-title">💬 Sana Özel WhatsApp Mesajı</div>', unsafe_allow_html=True)
-if st.button("✨ Mesajı Yapay Zekâ ile Yaz", type="primary"):
-    calls = st.session_state.get("ai_calls", 0)
-    if api_key and GENAI_OK and calls >= MAX_AI_CALLS:
-        st.info("Bu oturumdaki yapay zekâ hakkı doldu. Hazır şablon mesaj gösteriliyor.")
-        st.session_state["advice"] = (sig, mock_msg, mock_note, "Hazır şablon")
-    elif api_key and GENAI_OK:
-        st.session_state["ai_calls"] = calls + 1
-        try:
-            with st.spinner("Ziraat mühendisi mesajı yazıyor..."):
-                g_msg, g_note = gemini_advice(api_key, model_name, params, res, ad, wlines)
-            st.session_state["advice"] = (sig, g_msg, g_note, f"Gemini ({model_name})")
-        except Exception as exc:
-            st.warning(f"Yapay zekâya şu an ulaşılamadı, hazır şablon kullanılıyor. Ayrıntı: {exc}")
-            st.session_state["advice"] = (sig, mock_msg, mock_note, "Hazır şablon")
-    else:
-        st.info("Yapay zekâ anahtarı olmadığı için hazır şablon mesaj gösteriliyor.")
-        st.session_state["advice"] = (sig, mock_msg, mock_note, "Hazır şablon")
-
-adv = st.session_state["advice"]
-if adv and adv[0] == sig:
-    _, msg_text, tech_note, source = adv
-else:
-    msg_text, tech_note, source = mock_msg, mock_note, "Hazır şablon"
-
-now_t = datetime.datetime.now().strftime("%H:%M")
-st.markdown(
-    f'<div class="phone"><div class="hdr">💬 Burdur Sulama Kooperatifi</div>'
-    f'<div class="bubble">{html.escape(msg_text)}<span class="time">{now_t} ✓✓</span></div></div>',
-    unsafe_allow_html=True)
-st.write("")
-b1, b2 = st.columns(2)
-with b1:
-    copy_button(msg_text)
-with b2:
-    st.link_button("🟢 WhatsApp ile Paylaş", "https://wa.me/?text=" + urllib.parse.quote(msg_text),
-                   use_container_width=True)
-
-# ----------------------------------------------------------------------------
-# RAPOR VE TEKNİK AYRINTILAR (KOOPERATİF / MÜHENDİS İÇİN)
-# ----------------------------------------------------------------------------
-st.write("")
-report = build_report(params, res, ad, msg_text, tech_note, source, warnings)
-st.download_button("📄 Raporu İndir (.txt)", data=report.encode("utf-8"),
-                   file_name="agro_dairy_karar_raporu.txt", mime="text/plain")
-
-with st.expander("🔧 Kooperatif / mühendis için hesap ayrıntıları"):
-    st.markdown("**Önce - Sonra karşılaştırması (sezonluk)**")
-    st.dataframe(pd.DataFrame({
-        "Gösterge": ["Su (m³)", "Pompa elektriği (kWh)", "Elektrik fiyatı (TL/kWh)", "Elektrik faturası (TL)"],
-        "Şimdiki Durum": [fmt(res["water_a"]), fmt(res["e_a"]), fmt(res["price_a"], 2), fmt(res["cost_a"])],
-        "Agro-Dairy Önerisi": [fmt(res["water_b"]), fmt(res["e_b"]), fmt(res["price_b"], 2), fmt(res["cost_b"])],
-    }), use_container_width=True, hide_index=True)
-    st.markdown("**Ekim deseni (alan payı)**")
-    st.dataframe(pd.DataFrame([{"Bitki": k, "Şimdiki": f"%{fmt(MIX_A.get(k, 0) * 100)}",
-                                "Öneri": f"%{fmt(MIX_B[k] * 100)}"} for k in MIX_B]),
-                 use_container_width=True, hide_index=True)
-    zA, zB = res["zA"], res["zB"]
-    st.markdown("**Yem dengesi (inek başı, günlük)**")
-    st.dataframe(pd.DataFrame({
-        "Gösterge": ["Enerji karşılama (%)", "Protein karşılama (%)", "Ek kesif yem (kg)"],
-        "Şimdiki": [fmt(zA["nel_cov"], 1), fmt(zA["cp_cov"], 1), fmt(zA["extra_conc_kg"], 2)],
-        "Öneri": [fmt(zB["nel_cov"], 1), fmt(zB["cp_cov"], 1), fmt(zB["extra_conc_kg"], 2)],
-    }), use_container_width=True, hide_index=True)
-    st.markdown(
-        f"Ek yem maliyeti (sezonluk): **{fmt(res['extra_feed_cost'])} TL**. "
-        f"Faturadan kazanç bundan düşüldüğünde net kazanç **{fmt(res['net_benefit'])} TL**.")
-    st.markdown("**Teknik karar notu**")
-    st.write(tech_note)
-    st.caption("Pompa enerjisi: E (kWh) = (Su m³ × Derinlik m × 9,81) / (3600 × Pompa verimi). "
-               "Katsayılar ve fiyatlar sentetik varsayımdır, saha verisiyle doğrulanmalıdır.")
+    coop_view()
